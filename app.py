@@ -154,22 +154,64 @@ class FormatAnalyzer:
 
     def _parse_formats(self, info: Dict[str, Any]) -> Dict[str, Any]:
         formats: List[Dict[str, Any]] = []
+        seen_formats = set()  # Deduplicate similar formats
+        
         for f in info.get("formats", []):
+            # Skip storyboards and other non-downloadable formats
             if f.get("format_note") == "storyboard":
                 continue
-            formats.append(
-                {
-                    "format_id": f.get("format_id", ""),
-                    "ext": f.get("ext", "unknown"),
-                    "resolution": f.get("resolution") or ("audio only" if (f.get("vcodec") == "none") else None) or "",
-                    "filesize": f.get("filesize") or f.get("filesize_approx"),
-                    "vcodec": f.get("vcodec", "none"),
-                    "acodec": f.get("acodec", "none"),
-                    "fps": f.get("fps"),
-                    "vbr": f.get("vbr"),
-                    "abr": f.get("abr"),
-                }
+            
+            # Extract key properties
+            format_id = f.get("format_id", "")
+            vcodec = f.get("vcodec", "none")
+            acodec = f.get("acodec", "none")
+            
+            # Skip if both codecs are none
+            if vcodec == "none" and acodec == "none":
+                continue
+            
+            # Build format data
+            fmt = {
+                "format_id": format_id,
+                "ext": f.get("ext", "unknown"),
+                "filesize": f.get("filesize") or f.get("filesize_approx"),
+                "vcodec": vcodec,
+                "acodec": acodec,
+                "fps": f.get("fps"),
+                "vbr": f.get("vbr"),
+                "abr": f.get("abr"),
+                "width": f.get("width"),
+                "height": f.get("height"),
+            }
+            
+            # Set resolution
+            if vcodec != "none":
+                width = f.get("width")
+                height = f.get("height")
+                if width and height:
+                    fmt["resolution"] = f"{width}x{height}"
+                else:
+                    fmt["resolution"] = f.get("resolution", "unknown")
+            else:
+                fmt["resolution"] = "audio only"
+            
+            # Create deduplication key
+            dedup_key = (
+                fmt["resolution"],
+                fmt["ext"],
+                fmt["vcodec"],
+                fmt["acodec"],
+                int(fmt["fps"] or 0),
+                int(fmt["abr"] or 0),
             )
+            
+            # Skip duplicates (keep first occurrence)
+            if dedup_key in seen_formats:
+                continue
+            seen_formats.add(dedup_key)
+            
+            formats.append(fmt)
+        
         return {
             "title": info.get("title", "Unknown Title"),
             "duration": info.get("duration", 0),
@@ -181,16 +223,26 @@ class FormatAnalyzer:
         for f in formats:
             vcodec = f.get("vcodec", "none")
             acodec = f.get("acodec", "none")
-            resolution = f.get("resolution") or ""
+            resolution = f.get("resolution", "")
             fps = f.get("fps")
             abr = f.get("abr")
+            ext = f.get("ext", "")
+            
             if vcodec != "none" and acodec != "none":
-                f["quality_label"] = f"{resolution} (complete)"
+                # Complete file (video + audio)
+                fps_str = f" {int(fps)}fps" if fps else ""
+                f["quality_label"] = f"{resolution}{fps_str} • {ext.upper()}"
             elif vcodec != "none":
-                f["quality_label"] = f"{resolution}{f' @ {fps}fps' if fps else ''} (video only)"
+                # Video only
+                fps_str = f" {int(fps)}fps" if fps else ""
+                f["quality_label"] = f"{resolution}{fps_str} • {ext.upper()} (video only)"
             else:
-                bitrate = f"{abr}kbps" if abr else "unknown"
-                f["quality_label"] = f"{bitrate} (audio only)"
+                # Audio only
+                if abr and abr > 0:
+                    bitrate = f"{int(abr)}kbps"
+                else:
+                    bitrate = "Audio"
+                f["quality_label"] = f"{bitrate} • {ext.upper()}"
         return formats
 
     def categorize_formats(self, formats: List[Dict[str, Any]]) -> Dict[str, List[Dict[str, Any]]]:
@@ -204,6 +256,21 @@ class FormatAnalyzer:
                 categorized["video_only"].append(f)
             else:
                 categorized["audio_only"].append(f)
+        
+        # Sort each category by quality (higher resolution/bitrate first)
+        def sort_key_video(f):
+            height = f.get("height") or 0
+            fps = f.get("fps") or 0
+            return (-height, -fps)
+        
+        def sort_key_audio(f):
+            abr = f.get("abr") or 0
+            return -abr
+        
+        categorized["video_audio"].sort(key=sort_key_video)
+        categorized["video_only"].sort(key=sort_key_video)
+        categorized["audio_only"].sort(key=sort_key_audio)
+        
         return categorized
 
 
@@ -253,6 +320,8 @@ class DownloadOrchestrator:
 
     def _download_worker(self, state: DownloadState) -> None:
         state.status = "downloading"
+        stderr_lines = []
+        
         try:
             cmd = [
                 get_ytdlp_binary(),
@@ -267,7 +336,7 @@ class DownloadOrchestrator:
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
+                stderr=subprocess.PIPE,
                 text=True,
                 bufsize=1,
                 shell=False,
@@ -278,6 +347,7 @@ class DownloadOrchestrator:
             if not process.stdout:
                 raise RuntimeError("Failed to read yt-dlp output")
 
+            # Read stdout for progress
             for line in process.stdout:
                 if state.cancel_requested:
                     try:
@@ -288,6 +358,10 @@ class DownloadOrchestrator:
                 self._parse_progress_line(line, state)
 
             process.wait(timeout=YTDLP_TIMEOUT)
+            
+            # Capture stderr for errors
+            if process.stderr:
+                stderr_lines = process.stderr.readlines()
 
             if process.returncode == 0:
                 state.status = "complete"
@@ -298,7 +372,26 @@ class DownloadOrchestrator:
                     size_mb = os.path.getsize(state.final_path) / (1024**2)
                     log.info(f"Download complete: {state.id} - {size_mb:.1f}MB")
             else:
-                raise subprocess.CalledProcessError(process.returncode, cmd)
+                # Parse error from stderr
+                error_msg = "".join(stderr_lines).strip()
+                if "ERROR" in error_msg:
+                    # Extract just the error part
+                    for line in stderr_lines:
+                        if "ERROR:" in line:
+                            error_msg = line.split("ERROR:", 1)[1].strip()
+                            break
+                
+                # User-friendly error messages
+                if "not available" in error_msg.lower() or "no suitable format" in error_msg.lower():
+                    raise RuntimeError("Selected format is no longer available. Try re-analyzing the video.")
+                elif "private" in error_msg.lower():
+                    raise RuntimeError("Video is private or unavailable")
+                elif "sign in" in error_msg.lower() or "age" in error_msg.lower():
+                    raise RuntimeError("Age-restricted video (not supported)")
+                elif error_msg:
+                    raise RuntimeError(f"Download failed: {error_msg[:200]}")
+                else:
+                    raise subprocess.CalledProcessError(process.returncode, cmd)
         except OSError as e:
             state.status = "failed"
             if e.errno == 28:  # ENOSPC - No space left on device
