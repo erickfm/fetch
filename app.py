@@ -154,7 +154,7 @@ class FormatAnalyzer:
 
     def _parse_formats(self, info: Dict[str, Any]) -> Dict[str, Any]:
         formats: List[Dict[str, Any]] = []
-        seen_formats = set()  # Deduplicate similar formats
+        seen_formats = {}  # Map dedup key to best format
         
         for f in info.get("formats", []):
             # Skip storyboards and other non-downloadable formats
@@ -199,18 +199,26 @@ class FormatAnalyzer:
             dedup_key = (
                 fmt["resolution"],
                 fmt["ext"],
-                fmt["vcodec"],
-                fmt["acodec"],
+                fmt["vcodec"][:20] if fmt["vcodec"] != "none" else "none",  # Truncate codec details
+                fmt["acodec"][:20] if fmt["acodec"] != "none" else "none",
                 int(fmt["fps"] or 0),
                 int(fmt["abr"] or 0),
             )
             
-            # Skip duplicates (keep first occurrence)
+            # Skip formats with no filesize info OR keep best one per dedup key
             if dedup_key in seen_formats:
+                # If new format has filesize and old doesn't, replace
+                existing = seen_formats[dedup_key]
+                if fmt["filesize"] and not existing["filesize"]:
+                    seen_formats[dedup_key] = fmt
+                # Otherwise skip this duplicate
                 continue
-            seen_formats.add(dedup_key)
-            
-            formats.append(fmt)
+            else:
+                # Only add if it has filesize OR is the first of its kind
+                seen_formats[dedup_key] = fmt
+        
+        # Filter to only formats with filesize
+        formats = [f for f in seen_formats.values() if f["filesize"]]
         
         return {
             "title": info.get("title", "Unknown Title"),
