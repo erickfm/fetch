@@ -329,6 +329,9 @@ class DownloadOrchestrator:
                 state.format_id,
                 "--newline",
                 "--no-playlist",
+                # Add options to work around 403 errors
+                "--extractor-args", "youtube:player_client=android",
+                "--no-check-certificate",
                 "-o",
                 state.output_path,
                 state.url,
@@ -382,7 +385,9 @@ class DownloadOrchestrator:
                             break
                 
                 # User-friendly error messages
-                if "not available" in error_msg.lower() or "no suitable format" in error_msg.lower():
+                if "403" in error_msg or "forbidden" in error_msg.lower():
+                    raise RuntimeError("YouTube blocked the download (403 Forbidden). This video may require yt-dlp to be updated, or try selecting a different format.")
+                elif "not available" in error_msg.lower() or "no suitable format" in error_msg.lower():
                     raise RuntimeError("Selected format is no longer available. Try re-analyzing the video.")
                 elif "private" in error_msg.lower():
                     raise RuntimeError("Video is private or unavailable")
