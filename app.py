@@ -331,15 +331,29 @@ class DownloadOrchestrator:
         stderr_lines = []
         
         try:
+            # Base command with aggressive 403 workarounds
             cmd = [
                 get_ytdlp_binary(),
                 "-f",
                 state.format_id,
                 "--newline",
                 "--no-playlist",
-                # Add options to work around 403 errors
-                "--extractor-args", "youtube:player_client=android",
+                # Use po_token and visitor_data if available (best for 403 fixes)
+                "--extractor-args", "youtube:player_client=ios,web;po_token=web+https://www.youtube.com",
+                # Headers to mimic real browser
+                "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "--referer", "https://www.youtube.com/",
+                "--add-header", "Accept-Language:en-US,en;q=0.9",
+                "--add-header", "Accept:text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "--add-header", "Sec-Fetch-Mode:navigate",
                 "--no-check-certificate",
+                # Network options
+                "--retries", "10",
+                "--fragment-retries", "10",
+                "--retry-sleep", "1",
+                # Force IPv4 (sometimes helps)
+                "-4",
+                # Output
                 "-o",
                 state.output_path,
                 state.url,
