@@ -173,6 +173,11 @@ class FormatAnalyzer:
             if vcodec == "none" and acodec == "none":
                 continue
             
+            # Skip formats with protocol issues
+            protocol = f.get("protocol", "")
+            if protocol and protocol in ["mhtml", "niconico_dmc"]:
+                continue
+            
             # Build format data
             fmt = {
                 "format_id": format_id,
@@ -185,6 +190,7 @@ class FormatAnalyzer:
                 "abr": f.get("abr"),
                 "width": f.get("width"),
                 "height": f.get("height"),
+                "tbr": f.get("tbr"),  # Total bitrate
             }
             
             # Set resolution
@@ -208,20 +214,28 @@ class FormatAnalyzer:
                 int(fmt["abr"] or 0),
             )
             
-            # Skip formats with no filesize info OR keep best one per dedup key
+            # Keep best format for each dedup key
             if dedup_key in seen_formats:
-                # If new format has filesize and old doesn't, replace
                 existing = seen_formats[dedup_key]
+                # Prefer format with filesize info
                 if fmt["filesize"] and not existing["filesize"]:
                     seen_formats[dedup_key] = fmt
-                # Otherwise skip this duplicate
-                continue
+                # If both have filesize or both don't, prefer higher bitrate
+                elif fmt.get("tbr", 0) > existing.get("tbr", 0):
+                    seen_formats[dedup_key] = fmt
             else:
-                # Only add if it has filesize OR is the first of its kind
                 seen_formats[dedup_key] = fmt
         
-        # Filter to only formats with filesize
-        formats = [f for f in seen_formats.values() if f["filesize"]]
+        # Don't filter out formats without filesize - keep all valid formats
+        formats = list(seen_formats.values())
+        
+        # Sort by quality (height for video, abr for audio)
+        formats.sort(key=lambda f: (
+            -(f.get("height") or 0),
+            -(f.get("fps") or 0),
+            -(f.get("abr") or 0),
+            -(f.get("tbr") or 0)
+        ))
         
         return {
             "title": info.get("title", "Unknown Title"),
@@ -238,15 +252,18 @@ class FormatAnalyzer:
             fps = f.get("fps")
             abr = f.get("abr")
             ext = f.get("ext", "")
+            height = f.get("height")
             
             if vcodec != "none" and acodec != "none":
                 # Complete file (video + audio)
                 fps_str = f" {int(fps)}fps" if fps else ""
-                f["quality_label"] = f"{resolution}{fps_str} • {ext.upper()}"
+                quality_str = f"{height}p" if height else resolution
+                f["quality_label"] = f"{quality_str}{fps_str} • {ext.upper()}"
             elif vcodec != "none":
                 # Video only
                 fps_str = f" {int(fps)}fps" if fps else ""
-                f["quality_label"] = f"{resolution}{fps_str} • {ext.upper()} (video only)"
+                quality_str = f"{height}p" if height else resolution
+                f["quality_label"] = f"{quality_str}{fps_str} • {ext.upper()} (video only)"
             else:
                 # Audio only
                 if abr and abr > 0:
@@ -341,8 +358,8 @@ class DownloadOrchestrator:
                 state.format_id,
                 "--newline",
                 "--no-playlist",
-                # Use po_token and visitor_data if available (best for 403 fixes)
-                "--extractor-args", "youtube:player_client=ios,web;po_token=web+https://www.youtube.com",
+                # Use multiple player clients for better compatibility
+                "--extractor-args", "youtube:player_client=ios,android,web",
                 # Headers to mimic real browser
                 "--user-agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
                 "--referer", "https://www.youtube.com/",
@@ -356,6 +373,8 @@ class DownloadOrchestrator:
                 "--retry-sleep", "1",
                 # Force IPv4 (sometimes helps)
                 "-4",
+                # Allow format fallback
+                "--format-sort", "res,ext:mp4:m4a",
                 # Output
                 "-o",
                 state.output_path,
@@ -399,9 +418,14 @@ class DownloadOrchestrator:
                 if state.final_path and os.path.exists(state.final_path):
                     size_mb = os.path.getsize(state.final_path) / (1024**2)
                     log.info(f"Download complete: {state.id} - {size_mb:.1f}MB")
+                else:
+                    raise RuntimeError("Download completed but file not found")
             else:
                 # Parse error from stderr
                 error_msg = "".join(stderr_lines).strip()
+                log.error(f"Download failed for {state.id}. Return code: {process.returncode}")
+                log.error(f"Full stderr: {error_msg[:500]}")
+                
                 if "ERROR" in error_msg:
                     # Extract just the error part
                     for line in stderr_lines:
@@ -409,19 +433,30 @@ class DownloadOrchestrator:
                             error_msg = line.split("ERROR:", 1)[1].strip()
                             break
                 
-                # User-friendly error messages
+                # User-friendly error messages with more details
                 if "403" in error_msg or "forbidden" in error_msg.lower():
-                    raise RuntimeError("YouTube blocked the download (403 Forbidden). This video may require yt-dlp to be updated, or try selecting a different format.")
-                elif "not available" in error_msg.lower() or "no suitable format" in error_msg.lower():
-                    raise RuntimeError("Selected format is no longer available. Try re-analyzing the video.")
-                elif "private" in error_msg.lower():
-                    raise RuntimeError("Video is private or unavailable")
+                    log.error(f"403 error for format {state.format_id}")
+                    raise RuntimeError("YouTube blocked the download (403 Forbidden). Try: 1) Re-analyzing the video, 2) Selecting a different format, or 3) Updating yt-dlp.")
+                elif "not available" in error_msg.lower():
+                    log.error(f"Format {state.format_id} not available")
+                    raise RuntimeError(f"Selected format (ID: {state.format_id}) is not available. Please re-analyze the video and try a different format.")
+                elif "requested format" in error_msg.lower() and "not available" in error_msg.lower():
+                    log.error(f"Format {state.format_id} not found")
+                    raise RuntimeError(f"Format ID {state.format_id} not found. The video formats may have changed - please re-analyze.")
+                elif "no suitable format" in error_msg.lower():
+                    log.error(f"No suitable format found for {state.format_id}")
+                    raise RuntimeError("No suitable format found. Try selecting a different format.")
+                elif "private" in error_msg.lower() or "unavailable" in error_msg.lower():
+                    raise RuntimeError("Video is private, deleted, or unavailable")
                 elif "sign in" in error_msg.lower() or "age" in error_msg.lower():
                     raise RuntimeError("Age-restricted video (not supported)")
+                elif "premieres in" in error_msg.lower():
+                    raise RuntimeError("This is a premiere video that hasn't started yet")
                 elif error_msg:
-                    raise RuntimeError(f"Download failed: {error_msg[:200]}")
+                    # Include more context in generic errors
+                    raise RuntimeError(f"Download failed: {error_msg[:300]}")
                 else:
-                    raise subprocess.CalledProcessError(process.returncode, cmd)
+                    raise RuntimeError(f"Download failed with code {process.returncode}. Try re-analyzing and selecting a different format.")
         except OSError as e:
             state.status = "failed"
             if e.errno == 28:  # ENOSPC - No space left on device
