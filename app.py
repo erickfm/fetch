@@ -8,6 +8,7 @@ import secrets
 import logging
 import urllib.parse
 import subprocess
+import requests
 from dataclasses import dataclass, field
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, Future
@@ -23,6 +24,8 @@ from flask import (
     stream_with_context,
     abort,
 )
+
+from cobalt_fallback import CobaltDownloader
 
 
 # ----------------------------
@@ -580,6 +583,7 @@ downloads_path = ensure_download_dir(DOWNLOAD_DIR)
 orchestrator = DownloadOrchestrator(download_dir=str(downloads_path), max_workers=MAX_CONCURRENT)
 storage = StorageAgent(download_dir=str(downloads_path))
 analyzer = FormatAnalyzer(timeout=30)
+cobalt = CobaltDownloader()
 
 # Simple in-memory rate limiting for /analyze
 MAX_ANALYSIS_PER_MINUTE = 10
@@ -696,6 +700,61 @@ def serve_file(download_id: str) -> Response:
 def cancel_download(download_id: str) -> Response:
     orchestrator.cancel_download(download_id)
     return jsonify({"status": "cancelled"})
+
+
+@app.route("/download/cobalt", methods=["POST"])
+def download_with_cobalt() -> Response:
+    """Fallback download using Cobalt API when yt-dlp fails"""
+    body = request.get_json(silent=True) or {}
+    url = (body.get("url") or "").strip()
+    quality = (body.get("quality") or "max").strip()
+    audio_only = body.get("audio_only", False)
+    
+    if not is_valid_youtube_url(url):
+        return jsonify({"error": "Invalid YouTube URL"}), 400
+    
+    try:
+        log.info(f"Attempting Cobalt download for: {url}")
+        
+        # Get download URL from Cobalt
+        if audio_only:
+            result = cobalt.get_audio_url(url)
+        else:
+            result = cobalt.get_download_url(url, quality)
+        
+        if not result or not result.get("url"):
+            return jsonify({"error": "Cobalt API failed to get download URL"}), 502
+        
+        download_url = result["url"]
+        filename = result.get("filename", "video.mp4")
+        
+        # Download the file from Cobalt's URL
+        download_id = secrets.token_urlsafe(16)
+        output_path = downloads_path / f"{download_id}_{filename}"
+        
+        # Stream download from Cobalt
+        response = requests.get(download_url, stream=True, timeout=300)
+        response.raise_for_status()
+        
+        with open(output_path, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                if chunk:
+                    f.write(chunk)
+        
+        log.info(f"Cobalt download complete: {download_id}")
+        
+        return jsonify({
+            "download_id": download_id + "_" + filename.replace(".", "_"),
+            "status": "complete",
+            "method": "cobalt"
+        })
+        
+    except requests.RequestException as e:
+        log.error(f"Cobalt download failed: {e}")
+        return jsonify({"error": f"Download failed: {str(e)}"}), 500
+    except Exception as e:
+        log.exception("Unexpected error in Cobalt download")
+        return jsonify({"error": f"Unexpected error: {str(e)}"}), 500
 
 
 @app.route("/health")

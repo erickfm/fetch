@@ -434,6 +434,18 @@
         </button>
       </div>
       <div id="formatError" class="error hidden"></div>
+      <div id="cobaltFallback" class="hidden" style="margin-top: 16px; padding: 16px; background: rgba(255, 193, 7, 0.1); border: 2px solid rgba(255, 193, 7, 0.3); border-radius: 12px;">
+        <div style="font-weight: 600; margin-bottom: 8px;">⚠️ yt-dlp Failed - Try Alternative Method</div>
+        <div style="font-size: 14px; color: var(--text-muted); margin-bottom: 12px;">
+          Use Cobalt API as fallback (may have different quality options)
+        </div>
+        <div style="display: flex; gap: 8px; flex-wrap: wrap;">
+          <button id="cobaltMaxBtn" class="btn-primary">Download Best Quality</button>
+          <button id="cobalt1080Btn" class="btn-secondary">1080p</button>
+          <button id="cobalt720Btn" class="btn-secondary">720p</button>
+          <button id="cobaltAudioBtn" class="btn-secondary">Audio Only</button>
+        </div>
+      </div>
     </div>
 
     <!-- Progress Card -->
@@ -612,6 +624,7 @@
       }
       
       $('formatError').classList.add('hidden');
+      $('cobaltFallback').classList.add('hidden');
       $('downloadBtn').disabled = true;
       $('downloadBtn').innerHTML = '<span class="spinner"></span>Starting...';
       
@@ -628,10 +641,16 @@
         const data = await res.json();
         
         if (!res.ok) {
-          $('formatError').textContent = data.error || 'Failed to start download';
+          const error = data.error || 'Failed to start download';
+          $('formatError').textContent = error;
           $('formatError').classList.remove('hidden');
           $('downloadBtn').disabled = false;
           $('downloadBtn').textContent = 'Download Selected Format';
+          
+          // Show Cobalt fallback if 403 error
+          if (error.includes('403') || error.includes('Forbidden')) {
+            $('cobaltFallback').classList.remove('hidden');
+          }
           return;
         }
         
@@ -650,6 +669,60 @@
         $('downloadBtn').textContent = 'Download Selected Format';
       }
     });
+    
+    // Cobalt fallback buttons
+    const downloadWithCobalt = async (quality, audioOnly = false) => {
+      $('cobaltFallback').classList.add('hidden');
+      $('formatError').classList.add('hidden');
+      $('downloadBtn').innerHTML = '<span class="spinner"></span>Trying Cobalt...';
+      
+      try {
+        const res = await fetch('/download/cobalt', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            url: $('url').value.trim(),
+            quality: quality,
+            audio_only: audioOnly
+          })
+        });
+        
+        const data = await res.json();
+        
+        if (!res.ok) {
+          $('formatError').textContent = data.error || 'Cobalt download failed';
+          $('formatError').classList.remove('hidden');
+          $('downloadBtn').disabled = false;
+          $('downloadBtn').textContent = 'Download Selected Format';
+          $('cobaltFallback').classList.remove('hidden');
+          return;
+        }
+        
+        // Cobalt downloads directly, show success
+        $('formatCard').classList.add('hidden');
+        $('progressCard').classList.remove('hidden');
+        $('downloadTitle').textContent = `Downloaded: ${currentData.title}`;
+        $('progressBar').style.width = '100%';
+        $('progressText').textContent = '100%';
+        $('successSection').classList.remove('hidden');
+        $('cancelBtn').classList.add('hidden');
+        $('downloadLink').href = `/downloads/${data.download_id}`;
+        $('downloadLink').classList.remove('hidden');
+        $('newDownloadBtn').classList.remove('hidden');
+        $('progressCard').scrollIntoView({ behavior: 'smooth' });
+        
+      } catch (err) {
+        $('formatError').textContent = 'Network error with Cobalt. Please try again.';
+        $('formatError').classList.remove('hidden');
+        $('downloadBtn').disabled = false;
+        $('downloadBtn').textContent = 'Download Selected Format';
+      }
+    };
+    
+    $('cobaltMaxBtn').addEventListener('click', () => downloadWithCobalt('max'));
+    $('cobalt1080Btn').addEventListener('click', () => downloadWithCobalt('1080'));
+    $('cobalt720Btn').addEventListener('click', () => downloadWithCobalt('720'));
+    $('cobaltAudioBtn').addEventListener('click', () => downloadWithCobalt('max', true));
     
     // Progress stream
     const startProgressStream = id => {
